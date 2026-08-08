@@ -4,6 +4,8 @@ import { Router, RouterModule } from '@angular/router';
 import { AuthService } from '../../core/services/auth.service';
 import { StoreService } from '../../core/services/store.service';
 import { UtilsService } from '../../core/services/utils.service';
+import { ToastService } from '../../core/services/toast.service';
+import { ModalService } from '../../core/services/modal.service';
 import { User, Account, Transaction, Loan, Card, Notification } from '../../core/models/bank.models';
 
 @Component({
@@ -207,6 +209,53 @@ import { User, Account, Transaction, Loan, Card, Notification } from '../../core
           </div>
         </div>
       </div>
+
+      <!-- Pay EMI / Due Payments Section (Below Loan Status) -->
+      <div class="card mt-md">
+        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+          <div>
+            <h3>Pay Loan EMI</h3>
+            <p class="text-sm text-muted mb-none">Manage and clear due monthly EMI payments for your loans</p>
+          </div>
+          <span class="badge badge-primary" *ngIf="activeLoans.length > 0">{{ activeLoans.length }} Active Loan{{ activeLoans.length !== 1 ? 's' : '' }}</span>
+        </div>
+
+        <div *ngIf="activeLoans.length === 0" class="empty-state p-lg">
+          <span class="material-icons-round text-success">check_circle</span>
+          <h3>No EMI Payments Due</h3>
+          <p class="text-sm text-muted">You have no active disbursed loans requiring EMI payments.</p>
+        </div>
+
+        <div *ngIf="activeLoans.length > 0" class="table-responsive">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Loan Description</th>
+                <th>Linked Account</th>
+                <th>Remaining Principal</th>
+                <th>Monthly EMI Due</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr *ngFor="let l of activeLoans">
+                <td>
+                  <div class="font-semibold">{{ l.loanType }} Loan</div>
+                  <small class="text-muted font-mono">{{ l.loanId }} · {{ l.tenureMonths }} mos &#64; {{ l.interestRate }}%</small>
+                </td>
+                <td class="font-mono text-sm">{{ l.accountId }}</td>
+                <td class="font-semibold">{{ formatCurrency(l.amount) }}</td>
+                <td class="font-bold text-accent">{{ formatCurrency(l.emiAmount) }}</td>
+                <td>
+                  <button class="btn btn-success btn-sm" (click)="payEMI(l)" [disabled]="isPaying">
+                    <span class="material-icons-round">payment</span> Pay EMI
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   `
 })
@@ -223,15 +272,22 @@ export class DashboardComponent implements OnInit {
   totalEMI = 0;
   totalCreditDue = 0;
   activeLoans: Loan[] = [];
+  isPaying = false;
 
   constructor(
     private authService: AuthService,
     private storeService: StoreService,
-    private utilsService: UtilsService
+    private utilsService: UtilsService,
+    private toastService: ToastService,
+    private modalService: ModalService
   ) {}
 
   ngOnInit() {
     this.user = this.authService.getCurrentUser();
+    this.loadDashboardData();
+  }
+
+  loadDashboardData() {
     if (this.user) {
       const userId = this.user.userId;
       this.accounts = this.storeService.getAccountsByUser(userId).filter(a => a.status === 'ACTIVE');
@@ -256,6 +312,121 @@ export class DashboardComponent implements OnInit {
         })
         .reduce((s, t) => s + t.amount, 0);
     }
+  }
+
+  payEMI(loan: Loan) {
+    if (!this.user) return;
+
+    // Find account to deduct from (linked account with sufficient balance first, or any account with sufficient balance)
+    let account = this.accounts.find(a => a.accountId === loan.accountId && a.availableBalance >= loan.emiAmount);
+    if (!account) {
+      account = this.accounts.find(a => a.availableBalance >= loan.emiAmount);
+    }
+    if (!account) {
+      account = this.accounts.find(a => a.accountId === loan.accountId) || this.accounts[0];
+    }
+
+    if (!account) {
+      this.toastService.error('Payment Failed', 'No active bank account found for EMI deduction.');
+      return;
+    }
+
+    if (account.availableBalance < loan.emiAmount) {
+      this.toastService.error('Insufficient Balance', `Account ${account.accountId} has available balance of ${this.formatCurrency(account.availableBalance)}, which is less than EMI amount ${this.formatCurrency(loan.emiAmount)}.`);
+      return;
+    }
+
+    this.modalService.confirm(
+      'Confirm Pay EMI',
+      `Pay EMI amount of ${this.formatCurrency(loan.emiAmount)} for ${loan.loanType} Loan (${loan.loanId}) from account ${account.accountId}?`,
+      () => {
+        this.isPaying = true;
+        try {
+          const emiAmt = loan.emiAmount;
+
+          // 1. Deduct money from user account
+          const newBalance = account.balance - emiAmt;
+          const newAvailBalance = account.availableBalance - emiAmt;
+          this.storeService.updateAccount(account.accountId, {
+            balance: newBalance,
+            availableBalance: newAvailBalance
+          });
+
+          // 2. Deduct from loan principal balance
+          const remainingAmount = Math.max(0, loan.amount - emiAmt);
+          const isFullyPaid = remainingAmount === 0;
+          const newLoanStatus = isFullyPaid ? 'CLOSED' : loan.status;
+
+          // Update EMI schedule item if present
+          let emiSchedule = (loan as any).emiSchedule || [];
+          if (Array.isArray(emiSchedule) && emiSchedule.length > 0) {
+            const nextUpcoming = emiSchedule.find((item: any) => item.status === 'UPCOMING');
+            if (nextUpcoming) {
+              nextUpcoming.status = 'PAID';
+            }
+          }
+
+          this.storeService.updateLoan(loan.loanId, {
+            amount: remainingAmount,
+            status: newLoanStatus,
+            emiSchedule: emiSchedule
+          });
+
+          // 3. Record DEBIT transaction
+          const txnId = this.utilsService.generateTransactionId(this.storeService);
+          this.storeService.addTransaction({
+            transactionId: txnId,
+            accountId: account.accountId,
+            transactionType: 'DEBIT',
+            category: 'EMI',
+            amount: emiAmt,
+            balance: newBalance,
+            description: `EMI Payment - ${loan.loanType} Loan (${loan.loanId})`,
+            referenceId: loan.loanId,
+            date: this.utilsService.todayISO(),
+            time: new Date().toLocaleTimeString('en-US', { hour12: false }),
+            status: 'COMPLETED',
+            toAccount: 'BANK_LOAN_DEPT',
+            fromAccount: account.accountId
+          });
+
+          // 4. Send customer notification
+          this.storeService.addNotification({
+            id: 'N' + Date.now(),
+            userId: this.user!.userId,
+            title: isFullyPaid ? 'Loan Paid Off!' : 'EMI Paid Successfully',
+            message: isFullyPaid
+              ? `Congratulations! Your ${loan.loanType} loan (${loan.loanId}) is now fully paid off!`
+              : `EMI payment of ${this.formatCurrency(emiAmt)} for ${loan.loanType} loan (${loan.loanId}) completed successfully.`,
+            type: 'success',
+            timestamp: this.utilsService.nowISO(),
+            read: false
+          });
+
+          // 5. Add audit log entry
+          this.storeService.addAuditLog({
+            id: this.utilsService.generateAuditId(this.storeService),
+            userId: this.user!.userId,
+            action: 'EMI_PAYMENT',
+            target: loan.loanId,
+            details: `Paid EMI ${emiAmt} for loan ${loan.loanId} from account ${account.accountId}`,
+            timestamp: this.utilsService.nowISO()
+          });
+
+          this.toastService.success(
+            'EMI Paid!',
+            `Successfully deducted ${this.formatCurrency(emiAmt)} from account ${account.accountId} for Loan ${loan.loanId}.`
+          );
+
+          // Refresh UI state
+          this.loadDashboardData();
+        } catch (e) {
+          this.toastService.error('Error', 'Unable to process EMI payment.');
+        } finally {
+          this.isPaying = false;
+        }
+      }
+    );
   }
 
   formatCurrency(amount: number): string {

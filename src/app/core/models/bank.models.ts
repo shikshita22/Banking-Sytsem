@@ -98,6 +98,10 @@ export interface Loan {
   status: string;
   appliedDate: string;
   disbursedDate?: string;
+  approvedDate?: string;
+  remarks?: string;
+  documents?: string[];
+  emiSchedule?: any[];
 }
 
 export interface ScheduledPayment {

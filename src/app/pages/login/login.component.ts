@@ -36,9 +36,12 @@ import { ModalService } from '../../core/services/modal.service';
 
             <div class="form-group">
               <label class="form-label">Password <span class="text-danger">*</span></label>
-              <div class="input-group">
+              <div class="input-group has-icon-right">
                 <span class="input-icon"><span class="material-icons-round">lock</span></span>
-                <input type="password" class="form-control" name="password" [(ngModel)]="password" placeholder="Enter your password" required>
+                <input [type]="showPassword ? 'text' : 'password'" class="form-control" name="password" [(ngModel)]="password" placeholder="Enter your password" required>
+                <button type="button" class="input-icon-right" (click)="togglePasswordVisibility()" aria-label="Toggle password visibility" title="Toggle password visibility" style="display: inline-flex !important; opacity: 1 !important; visibility: visible !important; pointer-events: auto !important;">
+                  <span class="material-icons-round" style="font-size: 20px; color: var(--text-muted);">{{ showPassword ? 'visibility_off' : 'visibility' }}</span>
+                </button>
               </div>
             </div>
 
@@ -93,9 +96,14 @@ import { ModalService } from '../../core/services/modal.service';
 export class LoginComponent implements OnInit {
   identifier: string = '';
   password: string = '';
+  showPassword: boolean = false;
   remember: boolean = false;
   isLoading: boolean = false;
   isShaking: boolean = false;
+
+  togglePasswordVisibility() {
+    this.showPassword = !this.showPassword;
+  }
 
   constructor(
     private authService: AuthService,

@@ -89,12 +89,12 @@ import { Loan, User } from '../../core/models/bank.models';
                 <th>EMI</th>
                 <th>Status</th>
                 <th>Applied Date</th>
-                <th *ngIf="isCreditStaff">Actions</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               <tr *ngIf="filteredLoans.length === 0">
-                <td [attr.colspan]="isCreditStaff ? 10 : 8" class="text-center p-xl">
+                <td [attr.colspan]="isCreditStaff ? 10 : 9" class="text-center p-xl">
                   <div class="empty-state">
                     <span class="material-icons-round">track_changes</span>
                     <h3>No loans found</h3>
@@ -115,22 +115,28 @@ import { Loan, User } from '../../core/models/bank.models';
                 <td class="font-semibold text-accent">{{ formatCurrency(l.emiAmount) }}</td>
                 <td><span class="badge" [ngClass]="'badge-' + getStatusBadgeClass(l.status)">{{ l.status }}</span></td>
                 <td>{{ formatDate(l.appliedDate) }}</td>
-                <td *ngIf="isCreditStaff">
-                  <div style="display:flex; gap:6px;">
-                    <!-- Pending state actions -->
-                    <ng-container *ngIf="l.status === 'WAITING' || l.status === 'PENDING'">
-                      <button class="btn btn-success btn-xs" (click)="approveLoan(l)" title="Approve Loan Application">Approve</button>
-                      <button class="btn btn-danger btn-xs" (click)="rejectLoan(l)" title="Reject Loan Application">Reject</button>
+                <td>
+                  <div style="display:flex; gap:6px; align-items:center;">
+                    <!-- Credit staff actions -->
+                    <ng-container *ngIf="isCreditStaff">
+                      <ng-container *ngIf="l.status === 'WAITING' || l.status === 'PENDING'">
+                        <button class="btn btn-success btn-xs" (click)="approveLoan(l)" title="Approve Loan Application">Approve</button>
+                        <button class="btn btn-danger btn-xs" (click)="rejectLoan(l)" title="Reject Loan Application">Reject</button>
+                      </ng-container>
+
+                      <ng-container *ngIf="l.status === 'APPROVED'">
+                        <button class="btn btn-primary btn-xs" (click)="disburseLoan(l)" title="Disburse Funds to Applicant Account">Disburse Funds</button>
+                      </ng-container>
+
+                      <span *ngIf="l.status === 'DISBURSED'" class="text-xs text-success font-semibold">Disbursed on {{ formatDate(l.disbursedDate || '') }}</span>
+                      <span *ngIf="l.status === 'REJECTED'" class="text-xs text-danger">Rejected</span>
                     </ng-container>
 
-                    <!-- Approved state actions -->
-                    <ng-container *ngIf="l.status === 'APPROVED'">
-                      <button class="btn btn-primary btn-xs" (click)="disburseLoan(l)" title="Disburse Funds to Applicant Account">Disburse Funds</button>
+                    <!-- Customer actions -->
+                    <ng-container *ngIf="!isCreditStaff">
+                      <button *ngIf="l.status === 'DISBURSED'" class="btn btn-success btn-xs" (click)="payEMI(l)" title="Pay Monthly EMI">Pay EMI</button>
+                      <span *ngIf="l.status !== 'DISBURSED'" class="text-xs text-muted">-</span>
                     </ng-container>
-
-                    <!-- Disbursed / Rejected info badge -->
-                    <span *ngIf="l.status === 'DISBURSED'" class="text-xs text-success font-semibold">Disbursed on {{ formatDate(l.disbursedDate || '') }}</span>
-                    <span *ngIf="l.status === 'REJECTED'" class="text-xs text-danger">Rejected</span>
                   </div>
                 </td>
               </tr>
@@ -333,6 +339,112 @@ export class LoanStatusComponent implements OnInit {
       this.toastService.success('Disbursed!', `Loan ${loan.loanId} funds credited to account ${loan.accountId}.`);
       this.loadLoans();
     });
+  }
+
+  payEMI(loan: Loan) {
+    if (!this.user) return;
+
+    const userAccounts = this.storeService.getAccountsByUser(this.user.userId).filter(a => a.status === 'ACTIVE');
+    let account = userAccounts.find(a => a.accountId === loan.accountId && a.availableBalance >= loan.emiAmount);
+    if (!account) {
+      account = userAccounts.find(a => a.availableBalance >= loan.emiAmount);
+    }
+    if (!account) {
+      account = userAccounts.find(a => a.accountId === loan.accountId) || userAccounts[0];
+    }
+
+    if (!account) {
+      this.toastService.error('Payment Failed', 'No active bank account found for EMI deduction.');
+      return;
+    }
+
+    if (account.availableBalance < loan.emiAmount) {
+      this.toastService.error('Insufficient Balance', `Account ${account.accountId} has available balance of ${this.formatCurrency(account.availableBalance)}, which is less than EMI amount ${this.formatCurrency(loan.emiAmount)}.`);
+      return;
+    }
+
+    this.modalService.confirm(
+      'Confirm Pay EMI',
+      `Pay EMI amount of ${this.formatCurrency(loan.emiAmount)} for ${loan.loanType} Loan (${loan.loanId}) from account ${account.accountId}?`,
+      () => {
+        const emiAmt = loan.emiAmount;
+
+        // 1. Deduct balance from account
+        const newBalance = account.balance - emiAmt;
+        const newAvailBalance = account.availableBalance - emiAmt;
+        this.storeService.updateAccount(account.accountId, {
+          balance: newBalance,
+          availableBalance: newAvailBalance
+        });
+
+        // 2. Deduct remaining principal from loan
+        const remainingAmount = Math.max(0, loan.amount - emiAmt);
+        const isFullyPaid = remainingAmount === 0;
+        const newLoanStatus = isFullyPaid ? 'CLOSED' : loan.status;
+
+        let emiSchedule = (loan as any).emiSchedule || [];
+        if (Array.isArray(emiSchedule) && emiSchedule.length > 0) {
+          const nextUpcoming = emiSchedule.find((item: any) => item.status === 'UPCOMING');
+          if (nextUpcoming) {
+            nextUpcoming.status = 'PAID';
+          }
+        }
+
+        this.storeService.updateLoan(loan.loanId, {
+          amount: remainingAmount,
+          status: newLoanStatus,
+          emiSchedule: emiSchedule
+        });
+
+        // 3. Record DEBIT transaction
+        const txnId = this.utilsService.generateTransactionId(this.storeService);
+        this.storeService.addTransaction({
+          transactionId: txnId,
+          accountId: account.accountId,
+          transactionType: 'DEBIT',
+          category: 'EMI',
+          amount: emiAmt,
+          balance: newBalance,
+          description: `EMI Payment - ${loan.loanType} Loan (${loan.loanId})`,
+          referenceId: loan.loanId,
+          date: this.utilsService.todayISO(),
+          time: new Date().toLocaleTimeString('en-US', { hour12: false }),
+          status: 'COMPLETED',
+          toAccount: 'BANK_LOAN_DEPT',
+          fromAccount: account.accountId
+        });
+
+        // 4. Send notification
+        this.storeService.addNotification({
+          id: 'N' + Date.now(),
+          userId: this.user!.userId,
+          title: isFullyPaid ? 'Loan Paid Off!' : 'EMI Paid Successfully',
+          message: isFullyPaid
+            ? `Congratulations! Your ${loan.loanType} loan (${loan.loanId}) is now fully paid off!`
+            : `EMI payment of ${this.formatCurrency(emiAmt)} for ${loan.loanType} loan (${loan.loanId}) completed successfully.`,
+          type: 'success',
+          timestamp: this.utilsService.nowISO(),
+          read: false
+        });
+
+        // 5. Add audit log
+        this.storeService.addAuditLog({
+          id: this.utilsService.generateAuditId(this.storeService),
+          userId: this.user!.userId,
+          action: 'EMI_PAYMENT',
+          target: loan.loanId,
+          details: `Paid EMI ${emiAmt} for loan ${loan.loanId} from account ${account.accountId}`,
+          timestamp: this.utilsService.nowISO()
+        });
+
+        this.toastService.success(
+          'EMI Paid!',
+          `Successfully deducted ${this.formatCurrency(emiAmt)} from account ${account.accountId} for Loan ${loan.loanId}.`
+        );
+
+        this.loadLoans();
+      }
+    );
   }
 }
 
