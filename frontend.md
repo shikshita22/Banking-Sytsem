@@ -1,0 +1,1 @@
+this directory will include angular frontend for the application
